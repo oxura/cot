@@ -94,8 +94,6 @@ pub fn load(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     use cot::metadata::CommandMeta;
     use tempfile::TempDir;
@@ -180,14 +178,63 @@ edition = "2024"
     }
 
     #[cfg(unix)]
-    pub(crate) fn write_shell_script(path: &Path, body: &str) {
+    pub(crate) fn write_shell_script(path: &Path, body: &str) -> PathBuf {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
-        fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
+        let mut body_path = path.as_os_str().to_os_string();
+        body_path.push(".sh");
+        let body_path = PathBuf::from(body_path);
+        fs::write(&body_path, body).unwrap();
+
+        // A parallel fork can retain a writable descriptor to the body. Execute
+        // a checked-in script instead, so that descriptor cannot cause ETXTBSY.
+        if !path.exists() {
+            let script =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shell-script.sh");
+            std::os::unix::fs::symlink(script, path).unwrap();
+        }
+        body_path
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[cfg_attr(
+        miri,
+        ignore = "can't call foreign function `posix_spawnattr_init` on OS `linux`"
+    )]
+    fn shell_script_runs_while_body_is_open_for_writing() {
+        let (_guard, temp_dir) = canonical_temp_dir();
+        let binary_path = temp_dir.join("demo with spaces");
+        let body_path = write_shell_script(
+            &binary_path,
+            "printf '%s\\n' \"$0\" \"$1\" \"$2\" \"$PWD\" \"$COT_TEST_VALUE\"\n\
+             printf 'stderr\\n' >&2\nexit 42\n",
+        );
+        // Another test can fork while the fixture is being written and retain
+        // its writable descriptor until exec, even after this process closes
+        // it.
+        let _writer = fs::OpenOptions::new().write(true).open(body_path).unwrap();
+        let working_dir = temp_dir.join("working directory");
+        fs::create_dir(&working_dir).unwrap();
+
+        let output = std::process::Command::new(&binary_path)
+            .args(["--cot-metadata", "argument with spaces"])
+            .current_dir(&working_dir)
+            .env("COT_TEST_VALUE", "environment value")
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(42));
+        assert_eq!(output.stderr, b"stderr\n");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "{}\n--cot-metadata\nargument with spaces\n{}\nenvironment value\n",
+                binary_path.display(),
+                working_dir.display(),
+            ),
+        );
     }
 
     #[test]
