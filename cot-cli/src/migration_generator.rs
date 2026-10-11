@@ -1,3 +1,5 @@
+mod model_identity;
+
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::{Debug, Display};
@@ -12,6 +14,7 @@ use cot_codegen::model::{Field, Model, ModelArgs, ModelOpts, ModelType};
 use cot_codegen::symbol_resolver::SymbolResolver;
 use darling::FromMeta;
 use heck::ToSnakeCase;
+use model_identity::{ModelIdentities, ModelKey};
 use petgraph::graph::DiGraph;
 use petgraph::visit::EdgeRef;
 use proc_macro2::TokenStream;
@@ -196,7 +199,9 @@ impl MigrationGenerator {
         &self,
         source_files: Vec<SourceFile>,
     ) -> anyhow::Result<Option<GeneratedMigration>> {
+        let mut identities = ModelIdentities::from_files(&source_files);
         let AppState { models, migrations } = self.process_source_files(source_files)?;
+        identities.register_models(&models);
         let migration_processor = MigrationProcessor::new(migrations)?;
         let migration_models = migration_processor.latest_models();
 
@@ -207,8 +212,13 @@ impl MigrationGenerator {
             let migration_name = migration_processor.next_auto_migration_name()?;
             let dependencies = migration_processor.base_dependencies();
 
-            let migration =
-                GeneratedMigration::new(migration_name, modified_models, dependencies, operations);
+            let migration = GeneratedMigration::new(
+                migration_name,
+                modified_models,
+                dependencies,
+                operations,
+                &identities,
+            );
             Ok(Some(migration))
         }
     }
@@ -1048,10 +1058,11 @@ impl GeneratedMigration {
         modified_models: Vec<ModelInSource>,
         mut dependencies: Vec<DynDependency>,
         mut operations: Vec<DynOperation>,
+        identities: &ModelIdentities,
     ) -> Self {
-        Self::remove_cycles(&mut operations);
-        Self::toposort_operations(&mut operations);
-        dependencies.extend(Self::get_foreign_key_dependencies(&operations));
+        Self::remove_cycles(&mut operations, identities);
+        Self::toposort_operations(&mut operations, identities);
+        dependencies.extend(Self::get_foreign_key_dependencies(&operations, identities));
 
         Self {
             migration_name,
@@ -1063,13 +1074,16 @@ impl GeneratedMigration {
 
     /// Get the list of [`DynDependency`] for all foreign keys that point
     /// to models that are **not** created in this migration.
-    fn get_foreign_key_dependencies(operations: &[DynOperation]) -> Vec<DynDependency> {
-        let create_ops = Self::get_create_ops_map(operations);
+    fn get_foreign_key_dependencies(
+        operations: &[DynOperation],
+        identities: &ModelIdentities,
+    ) -> Vec<DynDependency> {
+        let create_ops = Self::get_create_ops_map(operations, identities);
         let ops_adding_foreign_keys = Self::get_ops_adding_foreign_keys(operations);
 
         let mut dependencies = Vec::new();
         for (_index, dependency_ty) in &ops_adding_foreign_keys {
-            if !create_ops.contains_key(dependency_ty) {
+            if !create_ops.contains_key(&identities.key(dependency_ty)) {
                 dependencies.push(DynDependency::Model {
                     model_type: dependency_ty.clone(),
                 });
@@ -1089,8 +1103,8 @@ impl GeneratedMigration {
     /// # See also
     ///
     /// * [`Self::remove_dependency`]
-    fn remove_cycles(operations: &mut Vec<DynOperation>) {
-        let graph = Self::construct_dependency_graph(operations);
+    fn remove_cycles(operations: &mut Vec<DynOperation>, identities: &ModelIdentities) {
+        let graph = Self::construct_dependency_graph(operations, identities);
 
         let cycle_edges = petgraph::algo::feedback_arc_set::greedy_feedback_arc_set(&graph);
         for edge_id in cycle_edges {
@@ -1105,7 +1119,7 @@ impl GeneratedMigration {
                 from_op, to_op
             );
 
-            let to_add = Self::remove_dependency(from_op, &to_op);
+            let to_add = Self::remove_dependency(from_op, &to_op, identities);
             operations.extend(to_add);
         }
     }
@@ -1116,7 +1130,11 @@ impl GeneratedMigration {
     /// point to the model created by `to` operation, and creating a new
     /// `AddField` operation for each removed foreign key.
     #[must_use]
-    fn remove_dependency(from: &mut DynOperation, to: &DynOperation) -> Vec<DynOperation> {
+    fn remove_dependency(
+        from: &mut DynOperation,
+        to: &DynOperation,
+        identities: &ModelIdentities,
+    ) -> Vec<DynOperation> {
         match from {
             DynOperation::CreateModel {
                 table_name,
@@ -1153,7 +1171,7 @@ impl GeneratedMigration {
                 let mut result = Vec::new();
                 let (fields_to_remove, fields_to_retain): (Vec<_>, Vec<_>) = std::mem::take(fields)
                     .into_iter()
-                    .partition(|field| is_field_foreign_key_to(field, to_type));
+                    .partition(|field| is_field_foreign_key_to(field, to_type, identities));
                 *fields = fields_to_retain;
 
                 for field in fields_to_remove {
@@ -1196,8 +1214,8 @@ impl GeneratedMigration {
     ///
     /// This method should be called after removing cycles; otherwise it will
     /// panic.
-    fn toposort_operations(operations: &mut [DynOperation]) {
-        let graph = Self::construct_dependency_graph(operations);
+    fn toposort_operations(operations: &mut [DynOperation], identities: &ModelIdentities) {
+        let graph = Self::construct_dependency_graph(operations, identities);
 
         let sorted = petgraph::algo::toposort(&graph, None)
             .expect("cycles shouldn't exist after removing them");
@@ -1215,8 +1233,11 @@ impl GeneratedMigration {
     /// if operation B creates a foreign key that points to a model created by
     /// operation A.
     #[must_use]
-    fn construct_dependency_graph(operations: &[DynOperation]) -> DiGraph<usize, (), usize> {
-        let create_ops = Self::get_create_ops_map(operations);
+    fn construct_dependency_graph(
+        operations: &[DynOperation],
+        identities: &ModelIdentities,
+    ) -> DiGraph<usize, (), usize> {
+        let create_ops = Self::get_create_ops_map(operations, identities);
         let ops_adding_foreign_keys = Self::get_ops_adding_foreign_keys(operations);
 
         let mut graph = DiGraph::with_capacity(operations.len(), 0);
@@ -1225,7 +1246,7 @@ impl GeneratedMigration {
             graph.add_node(i);
         }
         for (i, dependency_ty) in &ops_adding_foreign_keys {
-            if let Some(&dependency) = create_ops.get(dependency_ty) {
+            if let Some(&dependency) = create_ops.get(&identities.key(dependency_ty)) {
                 graph.add_edge(
                     petgraph::graph::NodeIndex::new(dependency),
                     petgraph::graph::NodeIndex::new(*i),
@@ -1240,12 +1261,15 @@ impl GeneratedMigration {
     /// Return a map of (resolved) model types to the index of the
     /// operation that creates given model.
     #[must_use]
-    fn get_create_ops_map(operations: &[DynOperation]) -> HashMap<syn::Type, usize> {
+    fn get_create_ops_map(
+        operations: &[DynOperation],
+        identities: &ModelIdentities,
+    ) -> HashMap<ModelKey, usize> {
         operations
             .iter()
             .enumerate()
             .filter_map(|(i, op)| match op {
-                DynOperation::CreateModel { model_ty, .. } => Some((model_ty.clone(), i)),
+                DynOperation::CreateModel { model_ty, .. } => Some((identities.key(model_ty), i)),
                 _ => None,
             })
             .collect()
@@ -1444,8 +1468,9 @@ pub enum DynOperation {
 }
 
 /// Returns whether given [`Field`] is a foreign key to given type.
-fn is_field_foreign_key_to(field: &Field, ty: &syn::Type) -> bool {
-    foreign_key_for_field(field).is_some_and(|to_model| &to_model == ty)
+fn is_field_foreign_key_to(field: &Field, ty: &syn::Type, identities: &ModelIdentities) -> bool {
+    foreign_key_for_field(field)
+        .is_some_and(|to_model| identities.key(&to_model) == identities.key(ty))
 }
 
 /// Returns the type of the model that the given field is a foreign key to.
@@ -1711,7 +1736,7 @@ mod tests {
             },
         ];
 
-        GeneratedMigration::toposort_operations(&mut operations);
+        GeneratedMigration::toposort_operations(&mut operations, &ModelIdentities::default());
 
         assert_eq!(operations.len(), 2);
         if let DynOperation::CreateModel { table_name, .. } = &operations[0] {
@@ -1765,7 +1790,7 @@ mod tests {
             },
         ];
 
-        GeneratedMigration::remove_cycles(&mut operations);
+        GeneratedMigration::remove_cycles(&mut operations, &ModelIdentities::default());
 
         assert_eq!(operations.len(), 3);
         if let DynOperation::CreateModel {
@@ -1819,8 +1844,11 @@ mod tests {
             fields: vec![],
         };
 
-        let additional_ops =
-            GeneratedMigration::remove_dependency(&mut create_model_op, &add_field_op);
+        let additional_ops = GeneratedMigration::remove_dependency(
+            &mut create_model_op,
+            &add_field_op,
+            &ModelIdentities::default(),
+        );
 
         match create_model_op {
             DynOperation::CreateModel { fields, .. } => {
@@ -1846,7 +1874,10 @@ mod tests {
             fields: vec![],
         }];
 
-        let external_dependencies = GeneratedMigration::get_foreign_key_dependencies(&operations);
+        let external_dependencies = GeneratedMigration::get_foreign_key_dependencies(
+            &operations,
+            &ModelIdentities::default(),
+        );
         assert_eq!(external_dependencies, []);
     }
 
@@ -1870,7 +1901,10 @@ mod tests {
             }],
         }];
 
-        let external_dependencies = GeneratedMigration::get_foreign_key_dependencies(&operations);
+        let external_dependencies = GeneratedMigration::get_foreign_key_dependencies(
+            &operations,
+            &ModelIdentities::default(),
+        );
         assert_eq!(external_dependencies.len(), 1);
         assert_eq!(
             external_dependencies[0],
@@ -1919,7 +1953,10 @@ mod tests {
             },
         ];
 
-        let external_dependencies = GeneratedMigration::get_foreign_key_dependencies(&operations);
+        let external_dependencies = GeneratedMigration::get_foreign_key_dependencies(
+            &operations,
+            &ModelIdentities::default(),
+        );
         assert_eq!(external_dependencies.len(), 2);
         assert!(external_dependencies.contains(&DynDependency::Model {
             model_type: parse_quote!(my_crate::Table2),
