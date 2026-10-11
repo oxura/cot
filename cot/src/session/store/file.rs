@@ -126,6 +126,10 @@ impl SessionStore for FileStore {
                     file.write_all(json_data.as_bytes())
                         .await
                         .map_err(|err| FileStoreError::Io(Box::new(err)))?;
+                    // Await completion of Tokio's queued blocking write.
+                    file.flush()
+                        .await
+                        .map_err(|err| FileStoreError::Io(Box::new(err)))?;
                     return Ok(());
                 }
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
@@ -154,6 +158,9 @@ impl SessionStore for FileStore {
                 let json_data = serde_json::to_string(&record)
                     .map_err(|err| FileStoreError::Serialize(Box::new(err)))?;
                 file.write_all(json_data.as_bytes())
+                    .await
+                    .map_err(|err| FileStoreError::Io(Box::new(err)))?;
+                file.flush()
                     .await
                     .map_err(|err| FileStoreError::Io(Box::new(err)))?;
             }
@@ -396,5 +403,159 @@ mod tests {
 
         let sess_err: session_store::Error = FileStoreError::TooManyIdCollisions(42).into();
         assert!(matches!(sess_err, session_store::Error::Backend(_)));
+    }
+
+    struct BlockingGate {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        started: std::sync::mpsc::Receiver<()>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl BlockingGate {
+        fn spawn() -> Self {
+            let (release, wait) = std::sync::mpsc::channel();
+            let (acknowledge, started) = std::sync::mpsc::channel();
+            let task = tokio::task::spawn_blocking(move || {
+                acknowledge.send(()).expect("gate receiver is alive");
+                let _ = wait.recv_timeout(std::time::Duration::from_secs(30));
+            });
+            Self {
+                release: Some(release),
+                started,
+                task,
+            }
+        }
+
+        fn wait_until_started(&self) {
+            self.started
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("blocking gate should start");
+        }
+
+        fn release(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    impl Drop for BlockingGate {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn assert_write_waits_for_completion(create: bool) {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempdir().unwrap();
+            let store = FileStore::new(dir.path().to_path_buf()).unwrap();
+            let mut record = make_record();
+            record.data.insert("revision".into(), "new".into());
+            let expected = serde_json::to_vec(&record).unwrap();
+            let id = record.id;
+            let path = dir.path().join(id.to_string());
+            if create {
+                assert!(!path.exists());
+            } else {
+                let mut previous = record.clone();
+                previous.data.insert("revision".into(), "old".into());
+                let previous_bytes = serde_json::to_vec(&previous).unwrap();
+                std::fs::write(&path, &previous_bytes).unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), previous_bytes);
+            }
+
+            let mut opening_gate = BlockingGate::spawn();
+            opening_gate.wait_until_started();
+            let mut operation: Pin<Box<dyn Future<Output = session_store::Result<()>> + Send>> =
+                if create {
+                    store.create(&mut record)
+                } else {
+                    store.save(&record)
+                };
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(operation.as_mut().poll(&mut context).is_pending());
+
+            // Queue a second gate after open, but before polling its result.
+            // With one blocking worker this prevents the subsequent write.
+            let mut writing_gate = BlockingGate::spawn();
+            opening_gate.release();
+            writing_gate.wait_until_started();
+            assert!(path.is_file(), "open must have completed before the gate");
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+            let awaiting_write = match operation.as_mut().poll(&mut context) {
+                Poll::Pending => true,
+                Poll::Ready(Ok(())) => false,
+                Poll::Ready(Err(error)) => panic!("unexpected storage error: {error}"),
+            };
+            assert!(std::fs::read(&path).unwrap().is_empty());
+            assert!(!writing_gate.task.is_finished());
+            writing_gate.release();
+            if awaiting_write {
+                tokio::time::timeout(std::time::Duration::from_secs(10), operation)
+                    .await
+                    .expect("write should finish after releasing the gate")
+                    .unwrap();
+            } else {
+                drop(operation);
+            }
+            // On the unfixed implementation, this queued load also drains the
+            // earlier write. Check the completion contract separately below.
+            let loaded = tokio::time::timeout(std::time::Duration::from_secs(10), store.load(&id))
+                .await
+                .expect("load should finish")
+                .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), expected);
+            assert_eq!(loaded, Some(record));
+            assert!(awaiting_write, "must wait for the blocking write to finish");
+        });
+    }
+
+    #[test]
+    fn test_create_waits_for_write_completion() {
+        assert_write_waits_for_completion(true);
+    }
+
+    #[test]
+    fn test_save_waits_for_write_completion() {
+        assert_write_waits_for_completion(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cot::test]
+    async fn test_save_propagates_delayed_write_error() {
+        use std::os::unix::fs::FileTypeExt;
+
+        assert!(
+            std::fs::metadata("/dev/full")
+                .unwrap()
+                .file_type()
+                .is_char_device()
+        );
+        let dir = tempdir().unwrap();
+        let store = FileStore::new(dir.path().to_path_buf()).unwrap();
+        let record = make_record();
+        let path = dir.path().join(record.id.to_string());
+        std::os::unix::fs::symlink("/dev/full", &path).unwrap();
+        // Opening succeeds; the device rejects the later write. Tokio may
+        // report that error only when its buffered write is flushed.
+        let opened = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .await
+            .expect("the failing-write device should open successfully");
+        drop(opened);
+        let error = store.save(&record).await.unwrap_err();
+        assert!(matches!(error, session_store::Error::Backend(_)));
     }
 }
