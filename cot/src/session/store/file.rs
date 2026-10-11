@@ -497,7 +497,7 @@ mod tests {
                 Poll::Ready(Ok(())) => false,
                 Poll::Ready(Err(error)) => panic!("unexpected storage error: {error}"),
             };
-            assert!(std::fs::read(&path).unwrap().is_empty());
+            assert_eq!(std::fs::read(&path).unwrap(), [0u8; 0]);
             assert!(!writing_gate.task.is_finished());
             writing_gate.release();
             if awaiting_write {
